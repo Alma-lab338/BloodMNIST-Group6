@@ -1,0 +1,155 @@
+#Load neede libraries
+import tensorflow as tf
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sn
+import numpy as np
+import pandas as pd
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Flatten, Dropout
+from sklearn.metrics import classification_report, confusion_matrix
+import medmnist
+from PIL import Image
+from medmnist import INFO, Evaluator
+from tensorflow.keras.utils import plot_model
+from clearml import Task, OutputModel, Logger
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.losses import CategoricalCrossentropy
+from tensorflow.keras.callbacks import Callback, ModelCheckpoint
+import seaborn as sns
+
+# BloodMNIST dataset information
+data_flag = 'bloodmnist'
+info = INFO[data_flag]
+n_channels = info['n_channels']
+classes = info['label']
+n_classes = len(info['label'])
+DataClass = getattr(medmnist, info['python_class'])
+
+cml_labels = {classes[str(i)]: i for i in range(n_classes)}
+print(info)
+
+# Normalize data and class convertiong into one-hot encoded label
+def preprocess(image, label):
+    image = tf.cast(image, tf.float32) / 255.0  # Normalize pixel values ranging from 0 to 255 to 0 and 1
+    image = (image - 0.5) / 0.5  # Normalize to [-1, 1] and centered around 0
+    label = tf.one_hot(label, n_classes) #One-hot encoding transforms the integer class label into a binary vector of length n_classes
+    return image, label
+
+#load data
+train_dataset = DataClass(split='train', transform=None, download=True)
+val_dataset = DataClass(split='val', transform=None, download=True)
+test_dataset = DataClass(split='test', transform=None, download=True)
+
+print(f'Train samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}, Test samples: {len(test_dataset)}')
+
+# count the number of samples in each class
+count = []
+for i in range(n_classes):
+    count.append((train_dataset.labels == i).sum())
+    print(f'{classes[str(i)]}: {count[i]}')
+
+def dataset_to_tf(data, batch_size):
+    images = []
+    labels = []
+    for img, lbl in data:
+        images.append(np.array(img))
+        labels.append(lbl[0])  # Convert to a scalar
+    images = np.stack(images)
+    labels = np.array(labels)
+    dataset = tf.data.Dataset.from_tensor_slices((images, labels))
+    dataset = dataset.map(preprocess)
+    return dataset.shuffle(buffer_size=10000).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+    
+batch_size = 2048
+sample_size = 16
+
+train_loader = dataset_to_tf(train_dataset, batch_size)
+val_loader = dataset_to_tf(val_dataset, batch_size)
+test_loader = dataset_to_tf(test_dataset, batch_size)
+
+# Show some random training images
+images, labels = next(iter(train_loader))
+plt.figure()
+for i in range(sample_size):
+    fig = plt.subplot(4, 4, i + 1)
+    plt.imshow((images[i].numpy() * 0.5 + 0.5).squeeze(), cmap='gray')
+    plt.axis('off')
+    plt.title(f'GT: {classes[str(tf.argmax(labels[i]).numpy())][:21]}')
+    
+plt.subplots_adjust(right=1.5, top=1.8)
+plt.show()
+
+#DNN
+def build_dnn_model(input_shape):
+    model = Sequential()
+    model.add(Flatten(input_shape=input_shape))  # Flatten the input
+    model.add(Dense(1024, activation='relu'))  # First fully connected layer
+    model.add(Dense(128, activation='relu'))   # Second fully connected layer
+    model.add(Dropout(0.25))  # Dropout layer for regularization
+    model.add(Dense(8, activation='softmax'))  # Output layer with softmax activation
+
+    return model
+
+input_shape = (28, 28, 3)
+dnn_model = build_dnn_model(input_shape)
+
+dnn_model.summary()
+
+plot_model(dnn_model, to_file='dnn_model.png', show_shapes=True)
+#set environment for clearML
+%env CLEARML_WEB_HOST=https://app.clear.ml
+%env CLEARML_API_HOST=https://api.clear.ml
+%env CLEARML_FILES_HOST=https://files.clear.ml
+%env CLEARML_API_ACCESS_KEY=UM467TGFU1L1ICCP9LHV
+%env CLEARML_API_SECRET_KEY=eBhwfcZCImDq6FZSTDByWrfCAMLsKA5D0ZzUfUuW9i2uYFMkPJ
+
+train_number = 1 
+task = Task.init(project_name="BloodMNIST-Group6", task_name=f"DNN training {train_number}")
+learning_rate = 0.001
+dnn_model.compile(optimizer=Adam(learning_rate), 
+                  loss=CategoricalCrossentropy(), 
+                  metrics=['accuracy'])
+
+# Update hyperparameters to ClearML
+params = {
+    "number_of_epochs": 50,
+    "batch_size": batch_size,
+    "base_lr": learning_rate,
+    "decrease_lr": "by 10 every 30 epochs",
+    "loss_func": "CategoricalCrossentropy",
+    "optimizer": "Adam"
+}
+params = task.connect(params)
+
+# Upload model to ClearML
+output_model = OutputModel(task=task)
+output_model.update_labels(cml_labels)
+output_model.update_design(config_dict=dnn_model.get_config())
+
+# Callbacks for ClearML
+class ClearMLCallback(Callback):
+    def on_epoch_end(self, epoch, logs=None):
+        Logger.current_logger().report_scalar("Loss", "training loss", iteration=epoch, value=logs["loss"])
+        Logger.current_logger().report_scalar("Accuracy", "training accuracy", iteration=epoch, value=logs["accuracy"])
+        Logger.current_logger().report_scalar("Loss", "val loss", iteration=epoch, value=logs["val_loss"])
+        Logger.current_logger().report_scalar("Accuracy", "val accuracy", iteration=epoch, value=logs["val_accuracy"])
+
+checkpoint = ModelCheckpoint(filepath='model_{epoch}.keras', save_best_only=True, monitor='val_loss', mode='min')
+
+# Training the model
+history = dnn_model.fit(train_loader, 
+                        epochs=50, 
+                        validation_data=val_loader, 
+                        callbacks=[ClearMLCallback(), checkpoint])
+
+# Evaluate the model
+test_loss, test_accuracy = dnn_model.evaluate(test_loader)
+print(f'Test Loss: {test_loss:.4f}, Test Accuracy: {test_accuracy:.4f}')
+
+# Close ClearML task
+task.close()
+
+print('Finished Training')
+dnn_model.save('CNN_model.keras')
